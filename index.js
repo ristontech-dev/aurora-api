@@ -122,6 +122,97 @@ async function obterResumoDasContas() {
   };
 }
 
+
+function obterNomeCartao(dados, documentoId) {
+  const possibilidades = [
+    dados.nome,
+    dados.nome_cartao,
+    dados.nomeCartao,
+    dados.instituicao,
+    dados.banco,
+  ];
+
+  for (const valor of possibilidades) {
+    if (typeof valor === "string" && valor.trim()) {
+      return valor.trim();
+    }
+  }
+
+  return `Cartão ${documentoId.slice(0, 5)}`;
+}
+
+function obterNumero(valor, padrao = 0) {
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : padrao;
+}
+
+async function obterResumoDosCartoes() {
+  const usuarioRef = db.collection("users").doc(userUid);
+  const usuarioDoc = await usuarioRef.get();
+
+  if (!usuarioDoc.exists) {
+    return {
+      usuarioEncontrado: false,
+      quantidadeCartoes: 0,
+      quantidadeCartoesAtivos: 0,
+      limiteTotal: 0,
+      cartoes: [],
+    };
+  }
+
+  const cartoesSnapshot = await usuarioRef.collection("cartoes").get();
+
+  let limiteTotal = 0;
+  const cartoes = [];
+
+  cartoesSnapshot.forEach((documento) => {
+    const dados = documento.data();
+
+    if (dados.deleted_at) {
+      return;
+    }
+
+    const ativo = dados.ativo !== false;
+    const nome = obterNomeCartao(dados, documento.id);
+    const bandeira =
+      typeof dados.bandeira === "string" && dados.bandeira.trim()
+        ? dados.bandeira.trim()
+        : "bandeira não informada";
+
+    const limite = obterNumero(dados.limite);
+    const diaFechamento = obterNumero(
+      dados.dia_fechamento ?? dados.diaFechamento
+    );
+    const diaVencimento = obterNumero(
+      dados.dia_vencimento ?? dados.diaVencimento
+    );
+
+    if (ativo) {
+      limiteTotal += limite;
+    }
+
+    cartoes.push({
+      id: documento.id,
+      nome,
+      bandeira,
+      limite,
+      diaFechamento,
+      diaVencimento,
+      ativo,
+    });
+  });
+
+  cartoes.sort((a, b) => b.limite - a.limite);
+
+  return {
+    usuarioEncontrado: true,
+    quantidadeCartoes: cartoes.length,
+    quantidadeCartoesAtivos: cartoes.filter((cartao) => cartao.ativo).length,
+    limiteTotal,
+    cartoes,
+  };
+}
+
 const LaunchRequestHandler = {
   canHandle(handlerInput) {
     return (
@@ -220,6 +311,55 @@ const ConsultarContasIntentHandler = {
   },
 };
 
+
+const ConsultarCartoesIntentHandler = {
+  canHandle(handlerInput) {
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+      Alexa.getIntentName(handlerInput.requestEnvelope) ===
+        "ConsultarCartoesIntent"
+    );
+  },
+
+  async handle(handlerInput) {
+    const resumo = await obterResumoDosCartoes();
+
+    if (!resumo.usuarioEncontrado) {
+      return handlerInput.responseBuilder
+        .speak("Não encontrei seu cadastro financeiro.")
+        .getResponse();
+    }
+
+    if (resumo.quantidadeCartoes === 0) {
+      return handlerInput.responseBuilder
+        .speak("Você ainda não possui cartões cadastrados.")
+        .getResponse();
+    }
+
+    const detalhes = resumo.cartoes
+      .map((cartao) => {
+        const situacao = cartao.ativo ? "" : " Este cartão está inativo.";
+
+        return (
+          `${cartao.nome}, da bandeira ${cartao.bandeira}, ` +
+          `com limite de ${formatarDinheiro(cartao.limite)}. ` +
+          `A fatura fecha no dia ${cartao.diaFechamento} ` +
+          `e vence no dia ${cartao.diaVencimento}.${situacao}`
+        );
+      })
+      .join(" ");
+
+    const palavraCartao =
+      resumo.quantidadeCartoes === 1 ? "cartão" : "cartões";
+
+    return handlerInput.responseBuilder
+      .speak(
+        `Você possui ${resumo.quantidadeCartoes} ${palavraCartao}. ${detalhes}`
+      )
+      .getResponse();
+  },
+};
+
 const ResumoFinanceiroIntentHandler = {
   canHandle(handlerInput) {
     return (
@@ -271,6 +411,7 @@ const HelpIntentHandler = {
     return handlerInput.responseBuilder
       .speak(
         "Você pode dizer: qual é meu saldo, quanto tenho em cada conta, " +
+          "quais cartões eu tenho, qual é o limite do meu cartão, " +
           "ou faça um resumo financeiro."
       )
       .reprompt("O que deseja saber?")
@@ -310,7 +451,8 @@ const FallbackIntentHandler = {
     return handlerInput.responseBuilder
       .speak(
         "Ainda não entendi esse comando. " +
-          "Você pode perguntar qual é seu saldo ou quanto tem em cada conta."
+          "Você pode perguntar qual é seu saldo, quanto tem em cada conta " +
+          "ou quais cartões possui."
       )
       .reprompt("O que deseja consultar?")
       .getResponse();
@@ -338,6 +480,7 @@ const skill = Alexa.SkillBuilders.custom()
     LaunchRequestHandler,
     ConsultarSaldoIntentHandler,
     ConsultarContasIntentHandler,
+    ConsultarCartoesIntentHandler,
     ResumoFinanceiroIntentHandler,
     HelpIntentHandler,
     CancelAndStopIntentHandler,
@@ -378,6 +521,24 @@ app.get("/firebase-status", async (req, res) => {
         saldo: conta.saldo,
         saldoFormatado: formatarDinheiro(conta.saldo),
       })),
+      ...(await (async () => {
+        const cartoes = await obterResumoDosCartoes();
+        return {
+          quantidadeCartoes: cartoes.quantidadeCartoes,
+          quantidadeCartoesAtivos: cartoes.quantidadeCartoesAtivos,
+          limiteTotalCartoes: cartoes.limiteTotal,
+          limiteTotalCartoesFormatado: formatarDinheiro(cartoes.limiteTotal),
+          cartoes: cartoes.cartoes.map((cartao) => ({
+            nome: cartao.nome,
+            bandeira: cartao.bandeira,
+            limite: cartao.limite,
+            limiteFormatado: formatarDinheiro(cartao.limite),
+            diaFechamento: cartao.diaFechamento,
+            diaVencimento: cartao.diaVencimento,
+            ativo: cartao.ativo,
+          })),
+        };
+      })()),
     });
   } catch (error) {
     console.error("Erro no Firebase:", error);
