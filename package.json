@@ -1,0 +1,17 @@
+{
+  "name": "aurora-api",
+  "version": "1.0.0",
+  "description": "API da Aurora para o Minha Vida Financeira",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "dependencies": {
+    "ask-sdk-core": "^2.14.0",
+    "ask-sdk-express-adapter": "^2.14.0",
+    "express": "^5.1.0"
+  }
+}
