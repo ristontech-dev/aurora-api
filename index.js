@@ -11,25 +11,31 @@ const app = express();
 const credencialPath = "/etc/secrets/firebase-service-account.json";
 const userUid = process.env.USER_UID;
 
+// Verifica o arquivo secreto do Firebase
 if (!fs.existsSync(credencialPath)) {
   throw new Error(
     "Arquivo firebase-service-account.json não encontrado no Render."
   );
 }
 
+// Verifica o UID configurado no Render
 if (!userUid) {
   throw new Error("Variável USER_UID não configurada no Render.");
 }
 
+// Lê a conta de serviço
 const serviceAccount = JSON.parse(
   fs.readFileSync(credencialPath, "utf8")
 );
 
-initializeApp({
+// Inicializa o Firebase explicitamente no projeto da chave
+const firebaseApp = initializeApp({
   credential: cert(serviceAccount),
+  projectId: serviceAccount.project_id,
 });
 
-const db = getFirestore();
+// Seu banco aparece no Firebase com o ID "default"
+const db = getFirestore(firebaseApp, "default");
 
 function formatarDinheiro(valor) {
   return Number(valor || 0).toLocaleString("pt-BR", {
@@ -38,17 +44,40 @@ function formatarDinheiro(valor) {
   });
 }
 
+function obterValorConta(dados) {
+  const possibilidades = [
+    dados.saldoAtual,
+    dados.saldo_atual,
+    dados.saldo,
+    dados.valor,
+    dados.balance,
+  ];
+
+  for (const valor of possibilidades) {
+    const numero = Number(valor);
+
+    if (Number.isFinite(numero)) {
+      return numero;
+    }
+  }
+
+  return 0;
+}
+
 const LaunchRequestHandler = {
   canHandle(handlerInput) {
-    return Alexa.getRequestType(handlerInput.requestEnvelope) === "LaunchRequest";
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "LaunchRequest"
+    );
   },
 
   handle(handlerInput) {
+    const resposta =
+      "Olá! Eu sou a Aurora, assistente do Minha Vida Financeira. " +
+      "Você pode pedir seu saldo ou um resumo financeiro.";
+
     return handlerInput.responseBuilder
-      .speak(
-        "Olá! Eu sou a Aurora, assistente do Minha Vida Financeira. " +
-        "Você pode pedir seu saldo ou um resumo financeiro."
-      )
+      .speak(resposta)
       .reprompt("O que você deseja consultar?")
       .getResponse();
   },
@@ -64,29 +93,42 @@ const ConsultarSaldoIntentHandler = {
   },
 
   async handle(handlerInput) {
-    /*
-      Este caminho é provisório:
-      usuarios/{UID}
-
-      Depois vamos ajustar conforme a estrutura real do seu Firestore.
-    */
-    const usuarioRef = db.collection("usuarios").doc(userUid);
+    const usuarioRef = db.collection("users").doc(userUid);
     const usuarioDoc = await usuarioRef.get();
 
     if (!usuarioDoc.exists) {
       return handlerInput.responseBuilder
         .speak(
-          "A conexão com o Firebase funcionou, mas ainda não encontrei " +
-          "o documento do seu usuário no Firestore."
+          "A conexão com o Firebase funcionou, mas não encontrei seu usuário."
         )
         .getResponse();
     }
 
-    const dados = usuarioDoc.data();
-    const saldo = Number(dados.saldo || 0);
+    const contasSnapshot = await usuarioRef.collection("contas").get();
+
+    if (contasSnapshot.empty) {
+      return handlerInput.responseBuilder
+        .speak(
+          "Encontrei seu usuário, mas ainda não existem contas cadastradas."
+        )
+        .getResponse();
+    }
+
+    let saldoTotal = 0;
+    let quantidadeContas = 0;
+
+    contasSnapshot.forEach((documento) => {
+      saldoTotal += obterValorConta(documento.data());
+      quantidadeContas++;
+    });
+
+    const palavraConta = quantidadeContas === 1 ? "conta" : "contas";
 
     return handlerInput.responseBuilder
-      .speak(`Seu saldo atual é de ${formatarDinheiro(saldo)}.`)
+      .speak(
+        `Seu saldo total é de ${formatarDinheiro(saldoTotal)}, ` +
+          `somando ${quantidadeContas} ${palavraConta}.`
+      )
       .getResponse();
   },
 };
@@ -100,11 +142,28 @@ const ResumoFinanceiroIntentHandler = {
     );
   },
 
-  handle(handlerInput) {
+  async handle(handlerInput) {
+    const usuarioRef = db.collection("users").doc(userUid);
+    const usuarioDoc = await usuarioRef.get();
+
+    if (!usuarioDoc.exists) {
+      return handlerInput.responseBuilder
+        .speak("Não encontrei seu cadastro financeiro.")
+        .getResponse();
+    }
+
+    const contasSnapshot = await usuarioRef.collection("contas").get();
+
+    let saldoTotal = 0;
+
+    contasSnapshot.forEach((documento) => {
+      saldoTotal += obterValorConta(documento.data());
+    });
+
     return handlerInput.responseBuilder
       .speak(
-        "A conexão com a Aurora está funcionando. " +
-        "Agora estamos conectando os dados reais do Firestore."
+        `Seu resumo financeiro está disponível. ` +
+          `O saldo total das suas contas é de ${formatarDinheiro(saldoTotal)}.`
       )
       .getResponse();
   },
@@ -148,6 +207,25 @@ const CancelAndStopIntentHandler = {
   },
 };
 
+const FallbackIntentHandler = {
+  canHandle(handlerInput) {
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+      Alexa.getIntentName(handlerInput.requestEnvelope) ===
+        "AMAZON.FallbackIntent"
+    );
+  },
+
+  handle(handlerInput) {
+    return handlerInput.responseBuilder
+      .speak(
+        "Ainda não entendi esse comando. Você pode perguntar qual é seu saldo."
+      )
+      .reprompt("O que deseja consultar?")
+      .getResponse();
+  },
+};
+
 const ErrorHandler = {
   canHandle() {
     return true;
@@ -170,7 +248,8 @@ const skill = Alexa.SkillBuilders.custom()
     ConsultarSaldoIntentHandler,
     ResumoFinanceiroIntentHandler,
     HelpIntentHandler,
-    CancelAndStopIntentHandler
+    CancelAndStopIntentHandler,
+    FallbackIntentHandler
   )
   .addErrorHandlers(ErrorHandler)
   .create();
@@ -181,26 +260,43 @@ app.get("/", (req, res) => {
   res.status(200).json({
     online: true,
     servico: "Aurora API",
-    firebase: true,
+    firebaseInicializado: true,
+    projeto: serviceAccount.project_id,
+    banco: "default",
     mensagem: "Aurora está funcionando.",
   });
 });
 
 app.get("/firebase-status", async (req, res) => {
   try {
-    const usuarioDoc = await db.collection("usuarios").doc(userUid).get();
+    const usuarioRef = db.collection("users").doc(userUid);
+    const usuarioDoc = await usuarioRef.get();
+
+    let quantidadeContas = 0;
+
+    if (usuarioDoc.exists) {
+      const contasSnapshot = await usuarioRef.collection("contas").get();
+      quantidadeContas = contasSnapshot.size;
+    }
 
     res.status(200).json({
       firebase: true,
+      projeto: serviceAccount.project_id,
+      banco: "default",
       uidConfigurado: true,
+      uid: userUid,
       documentoUsuarioEncontrado: usuarioDoc.exists,
+      quantidadeContas,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Erro no Firebase:", error);
 
     res.status(500).json({
       firebase: false,
+      codigo: error.code || null,
       erro: error.message,
+      projeto: serviceAccount.project_id,
+      banco: "default",
     });
   }
 });
@@ -211,4 +307,6 @@ const port = process.env.PORT || 3000;
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`Aurora API iniciada na porta ${port}`);
+  console.log(`Projeto Firebase: ${serviceAccount.project_id}`);
+  console.log("Banco Firestore: default");
 });
