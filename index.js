@@ -61,6 +61,25 @@ function obterValorConta(dados) {
   return 0;
 }
 
+function obterNomeConta(dados, documentoId) {
+  const possibilidades = [
+    dados.nome,
+    dados.nomeConta,
+    dados.nome_conta,
+    dados.instituicao,
+    dados.banco,
+    dados.descricao,
+  ];
+
+  for (const valor of possibilidades) {
+    if (typeof valor === "string" && valor.trim()) {
+      return valor.trim();
+    }
+  }
+
+  return `Conta ${documentoId.slice(0, 5)}`;
+}
+
 async function obterResumoDasContas() {
   const usuarioRef = db.collection("users").doc(userUid);
   const usuarioDoc = await usuarioRef.get();
@@ -70,21 +89,36 @@ async function obterResumoDasContas() {
       usuarioEncontrado: false,
       quantidadeContas: 0,
       saldoTotal: 0,
+      contas: [],
     };
   }
 
   const contasSnapshot = await usuarioRef.collection("contas").get();
 
   let saldoTotal = 0;
+  const contas = [];
 
   contasSnapshot.forEach((documento) => {
-    saldoTotal += obterValorConta(documento.data());
+    const dados = documento.data();
+    const saldo = obterValorConta(dados);
+    const nome = obterNomeConta(dados, documento.id);
+
+    saldoTotal += saldo;
+
+    contas.push({
+      id: documento.id,
+      nome,
+      saldo,
+    });
   });
+
+  contas.sort((a, b) => b.saldo - a.saldo);
 
   return {
     usuarioEncontrado: true,
-    quantidadeContas: contasSnapshot.size,
+    quantidadeContas: contas.length,
     saldoTotal,
+    contas,
   };
 }
 
@@ -96,12 +130,12 @@ const LaunchRequestHandler = {
   },
 
   handle(handlerInput) {
-    const resposta =
-      "Olá! Eu sou a Aurora, assistente do Minha Vida Financeira. " +
-      "Você pode pedir seu saldo ou um resumo financeiro.";
-
     return handlerInput.responseBuilder
-      .speak(resposta)
+      .speak(
+        "Olá! Eu sou a Aurora, assistente do Minha Vida Financeira. " +
+          "Você pode pedir seu saldo, perguntar quanto tem em cada conta " +
+          "ou solicitar um resumo financeiro."
+      )
       .reprompt("O que você deseja consultar?")
       .getResponse();
   },
@@ -147,6 +181,45 @@ const ConsultarSaldoIntentHandler = {
   },
 };
 
+const ConsultarContasIntentHandler = {
+  canHandle(handlerInput) {
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+      Alexa.getIntentName(handlerInput.requestEnvelope) ===
+        "ConsultarContasIntent"
+    );
+  },
+
+  async handle(handlerInput) {
+    const resumo = await obterResumoDasContas();
+
+    if (!resumo.usuarioEncontrado) {
+      return handlerInput.responseBuilder
+        .speak("Não encontrei seu cadastro financeiro.")
+        .getResponse();
+    }
+
+    if (resumo.quantidadeContas === 0) {
+      return handlerInput.responseBuilder
+        .speak("Você ainda não possui contas cadastradas.")
+        .getResponse();
+    }
+
+    const detalhes = resumo.contas
+      .map(
+        (conta) =>
+          `${conta.nome}, com saldo de ${formatarDinheiro(conta.saldo)}`
+      )
+      .join(". ");
+
+    return handlerInput.responseBuilder
+      .speak(
+        `Você possui ${resumo.quantidadeContas} contas. ${detalhes}.`
+      )
+      .getResponse();
+  },
+};
+
 const ResumoFinanceiroIntentHandler = {
   canHandle(handlerInput) {
     return (
@@ -171,11 +244,15 @@ const ResumoFinanceiroIntentHandler = {
         .getResponse();
     }
 
+    const maiorConta = resumo.contas[0];
+
     return handlerInput.responseBuilder
       .speak(
         `Seu resumo financeiro está disponível. ` +
           `Você possui ${resumo.quantidadeContas} contas, ` +
-          `com saldo total de ${formatarDinheiro(resumo.saldoTotal)}.`
+          `com saldo total de ${formatarDinheiro(resumo.saldoTotal)}. ` +
+          `A conta com maior saldo é ${maiorConta.nome}, ` +
+          `com ${formatarDinheiro(maiorConta.saldo)}.`
       )
       .getResponse();
   },
@@ -193,7 +270,8 @@ const HelpIntentHandler = {
   handle(handlerInput) {
     return handlerInput.responseBuilder
       .speak(
-        "Você pode dizer: qual é meu saldo, ou faça um resumo financeiro."
+        "Você pode dizer: qual é meu saldo, quanto tenho em cada conta, " +
+          "ou faça um resumo financeiro."
       )
       .reprompt("O que deseja saber?")
       .getResponse();
@@ -231,7 +309,8 @@ const FallbackIntentHandler = {
   handle(handlerInput) {
     return handlerInput.responseBuilder
       .speak(
-        "Ainda não entendi esse comando. Você pode perguntar qual é seu saldo."
+        "Ainda não entendi esse comando. " +
+          "Você pode perguntar qual é seu saldo ou quanto tem em cada conta."
       )
       .reprompt("O que deseja consultar?")
       .getResponse();
@@ -258,6 +337,7 @@ const skill = Alexa.SkillBuilders.custom()
   .addRequestHandlers(
     LaunchRequestHandler,
     ConsultarSaldoIntentHandler,
+    ConsultarContasIntentHandler,
     ResumoFinanceiroIntentHandler,
     HelpIntentHandler,
     CancelAndStopIntentHandler,
@@ -293,6 +373,11 @@ app.get("/firebase-status", async (req, res) => {
       quantidadeContas: resumo.quantidadeContas,
       saldoTotal: resumo.saldoTotal,
       saldoTotalFormatado: formatarDinheiro(resumo.saldoTotal),
+      contas: resumo.contas.map((conta) => ({
+        nome: conta.nome,
+        saldo: conta.saldo,
+        saldoFormatado: formatarDinheiro(conta.saldo),
+      })),
     });
   } catch (error) {
     console.error("Erro no Firebase:", error);
