@@ -11,30 +11,25 @@ const app = express();
 const credencialPath = "/etc/secrets/firebase-service-account.json";
 const userUid = process.env.USER_UID;
 
-// Verifica o arquivo secreto do Firebase
 if (!fs.existsSync(credencialPath)) {
   throw new Error(
     "Arquivo firebase-service-account.json não encontrado no Render."
   );
 }
 
-// Verifica o UID configurado no Render
 if (!userUid) {
   throw new Error("Variável USER_UID não configurada no Render.");
 }
 
-// Lê a conta de serviço
 const serviceAccount = JSON.parse(
   fs.readFileSync(credencialPath, "utf8")
 );
 
-// Inicializa o Firebase explicitamente no projeto da chave
 const firebaseApp = initializeApp({
   credential: cert(serviceAccount),
   projectId: serviceAccount.project_id,
 });
 
-// Seu banco aparece no Firebase com o ID "default"
 const db = getFirestore(firebaseApp, "default");
 
 function formatarDinheiro(valor) {
@@ -48,6 +43,8 @@ function obterValorConta(dados) {
   const possibilidades = [
     dados.saldoAtual,
     dados.saldo_atual,
+    dados.saldoInicial,
+    dados.saldo_inicial,
     dados.saldo,
     dados.valor,
     dados.balance,
@@ -62,6 +59,33 @@ function obterValorConta(dados) {
   }
 
   return 0;
+}
+
+async function obterResumoDasContas() {
+  const usuarioRef = db.collection("users").doc(userUid);
+  const usuarioDoc = await usuarioRef.get();
+
+  if (!usuarioDoc.exists) {
+    return {
+      usuarioEncontrado: false,
+      quantidadeContas: 0,
+      saldoTotal: 0,
+    };
+  }
+
+  const contasSnapshot = await usuarioRef.collection("contas").get();
+
+  let saldoTotal = 0;
+
+  contasSnapshot.forEach((documento) => {
+    saldoTotal += obterValorConta(documento.data());
+  });
+
+  return {
+    usuarioEncontrado: true,
+    quantidadeContas: contasSnapshot.size,
+    saldoTotal,
+  };
 }
 
 const LaunchRequestHandler = {
@@ -93,10 +117,9 @@ const ConsultarSaldoIntentHandler = {
   },
 
   async handle(handlerInput) {
-    const usuarioRef = db.collection("users").doc(userUid);
-    const usuarioDoc = await usuarioRef.get();
+    const resumo = await obterResumoDasContas();
 
-    if (!usuarioDoc.exists) {
+    if (!resumo.usuarioEncontrado) {
       return handlerInput.responseBuilder
         .speak(
           "A conexão com o Firebase funcionou, mas não encontrei seu usuário."
@@ -104,9 +127,7 @@ const ConsultarSaldoIntentHandler = {
         .getResponse();
     }
 
-    const contasSnapshot = await usuarioRef.collection("contas").get();
-
-    if (contasSnapshot.empty) {
+    if (resumo.quantidadeContas === 0) {
       return handlerInput.responseBuilder
         .speak(
           "Encontrei seu usuário, mas ainda não existem contas cadastradas."
@@ -114,20 +135,13 @@ const ConsultarSaldoIntentHandler = {
         .getResponse();
     }
 
-    let saldoTotal = 0;
-    let quantidadeContas = 0;
-
-    contasSnapshot.forEach((documento) => {
-      saldoTotal += obterValorConta(documento.data());
-      quantidadeContas++;
-    });
-
-    const palavraConta = quantidadeContas === 1 ? "conta" : "contas";
+    const palavraConta =
+      resumo.quantidadeContas === 1 ? "conta" : "contas";
 
     return handlerInput.responseBuilder
       .speak(
-        `Seu saldo total é de ${formatarDinheiro(saldoTotal)}, ` +
-          `somando ${quantidadeContas} ${palavraConta}.`
+        `Seu saldo total é de ${formatarDinheiro(resumo.saldoTotal)}, ` +
+          `somando ${resumo.quantidadeContas} ${palavraConta}.`
       )
       .getResponse();
   },
@@ -143,27 +157,25 @@ const ResumoFinanceiroIntentHandler = {
   },
 
   async handle(handlerInput) {
-    const usuarioRef = db.collection("users").doc(userUid);
-    const usuarioDoc = await usuarioRef.get();
+    const resumo = await obterResumoDasContas();
 
-    if (!usuarioDoc.exists) {
+    if (!resumo.usuarioEncontrado) {
       return handlerInput.responseBuilder
         .speak("Não encontrei seu cadastro financeiro.")
         .getResponse();
     }
 
-    const contasSnapshot = await usuarioRef.collection("contas").get();
-
-    let saldoTotal = 0;
-
-    contasSnapshot.forEach((documento) => {
-      saldoTotal += obterValorConta(documento.data());
-    });
+    if (resumo.quantidadeContas === 0) {
+      return handlerInput.responseBuilder
+        .speak("Você ainda não possui contas cadastradas.")
+        .getResponse();
+    }
 
     return handlerInput.responseBuilder
       .speak(
         `Seu resumo financeiro está disponível. ` +
-          `O saldo total das suas contas é de ${formatarDinheiro(saldoTotal)}.`
+          `Você possui ${resumo.quantidadeContas} contas, ` +
+          `com saldo total de ${formatarDinheiro(resumo.saldoTotal)}.`
       )
       .getResponse();
   },
@@ -269,15 +281,7 @@ app.get("/", (req, res) => {
 
 app.get("/firebase-status", async (req, res) => {
   try {
-    const usuarioRef = db.collection("users").doc(userUid);
-    const usuarioDoc = await usuarioRef.get();
-
-    let quantidadeContas = 0;
-
-    if (usuarioDoc.exists) {
-      const contasSnapshot = await usuarioRef.collection("contas").get();
-      quantidadeContas = contasSnapshot.size;
-    }
+    const resumo = await obterResumoDasContas();
 
     res.status(200).json({
       firebase: true,
@@ -285,8 +289,10 @@ app.get("/firebase-status", async (req, res) => {
       banco: "default",
       uidConfigurado: true,
       uid: userUid,
-      documentoUsuarioEncontrado: usuarioDoc.exists,
-      quantidadeContas,
+      documentoUsuarioEncontrado: resumo.usuarioEncontrado,
+      quantidadeContas: resumo.quantidadeContas,
+      saldoTotal: resumo.saldoTotal,
+      saldoTotalFormatado: formatarDinheiro(resumo.saldoTotal),
     });
   } catch (error) {
     console.error("Erro no Firebase:", error);
