@@ -93,15 +93,47 @@ async function obterResumoDasContas() {
     };
   }
 
-  const contasSnapshot = await usuarioRef.collection("contas").get();
+  const [contasSnapshot, movimentacoesSnapshot] = await Promise.all([
+    usuarioRef.collection("contas").get(),
+    usuarioRef.collection("movimentacoes").get(),
+  ]);
+
+  const movimentosPorConta = new Map();
+
+  movimentacoesSnapshot.forEach((documento) => {
+    const dados = documento.data();
+
+    if (dados.deleted_at) {
+      return;
+    }
+
+    const conta = normalizarTexto(dados.conta);
+    const valor = Number(dados.valor || 0);
+
+    if (!conta || !Number.isFinite(valor)) {
+      return;
+    }
+
+    const atual = movimentosPorConta.get(conta) || 0;
+    const impacto = dados.tipo === "entrada" ? valor : -valor;
+    movimentosPorConta.set(conta, atual + impacto);
+  });
 
   let saldoTotal = 0;
   const contas = [];
 
   contasSnapshot.forEach((documento) => {
     const dados = documento.data();
-    const saldo = obterValorConta(dados);
     const nome = obterNomeConta(dados, documento.id);
+    const saldoBase = obterValorConta(dados);
+    const possuiSaldoAtual =
+      dados.saldoAtual != null ||
+      dados.saldo_atual != null ||
+      dados.saldo != null ||
+      dados.balance != null;
+
+    const movimentacoes = movimentosPorConta.get(normalizarTexto(nome)) || 0;
+    const saldo = possuiSaldoAtual ? saldoBase : saldoBase + movimentacoes;
 
     saldoTotal += saldo;
 
@@ -234,6 +266,72 @@ function obterSlot(handlerInput, nome) {
     slot.resolutions?.resolutionsPerAuthority?.[0]?.values?.[0]?.value?.name;
 
   return String(resolvido || slot.value || "").trim();
+}
+
+function obterSlotOriginal(handlerInput, nome) {
+  const slot = handlerInput.requestEnvelope?.request?.intent?.slots?.[nome];
+  return String(slot?.value || "").trim();
+}
+
+function obterAnoMesAtual() {
+  const partes = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(new Date());
+
+  const ano = partes.find((parte) => parte.type === "year")?.value;
+  const mes = partes.find((parte) => parte.type === "month")?.value;
+  return `${ano}-${mes}`;
+}
+
+function movimentacaoEhDoMes(dados, anoMes) {
+  const texto = String(dados.data || "");
+  return texto.slice(0, 7) === anoMes;
+}
+
+async function obterResumoMovimentacoes({ tipo, categoria = "" }) {
+  const snapshot = await db
+    .collection("users")
+    .doc(userUid)
+    .collection("movimentacoes")
+    .get();
+
+  const anoMes = obterAnoMesAtual();
+  const termos = Array.isArray(categoria)
+    ? categoria.map(normalizarTexto).filter(Boolean)
+    : [normalizarTexto(categoria)].filter(Boolean);
+
+  let total = 0;
+  let quantidade = 0;
+
+  snapshot.forEach((documento) => {
+    const dados = documento.data();
+
+    if (dados.deleted_at || dados.tipo !== tipo || !movimentacaoEhDoMes(dados, anoMes)) {
+      return;
+    }
+
+    if (termos.length > 0) {
+      const textoBusca = normalizarTexto(
+        `${dados.categoria || ""} ${dados.descricao || ""}`
+      );
+
+      if (!termos.some((termo) => textoBusca.includes(termo))) {
+        return;
+      }
+    }
+
+    const valor = Number(dados.valor || 0);
+    if (!Number.isFinite(valor)) {
+      return;
+    }
+
+    total += valor;
+    quantidade += 1;
+  });
+
+  return { total, quantidade, anoMes };
 }
 
 function converterValorFalado(valor) {
@@ -383,6 +481,26 @@ const ConsultarSaldoIntentHandler = {
         .speak(
           "Encontrei seu usuário, mas ainda não existem contas cadastradas."
         )
+        .getResponse();
+    }
+
+    const contaPedida = obterSlot(handlerInput, "conta");
+
+    if (contaPedida) {
+      const termo = normalizarTexto(contaPedida);
+      const conta =
+        resumo.contas.find((item) => normalizarTexto(item.nome) === termo) ||
+        resumo.contas.find((item) => normalizarTexto(item.nome).includes(termo)) ||
+        resumo.contas.find((item) => termo.includes(normalizarTexto(item.nome)));
+
+      if (!conta) {
+        return handlerInput.responseBuilder
+          .speak(`Não encontrei a conta ${contaPedida}.`)
+          .getResponse();
+      }
+
+      return handlerInput.responseBuilder
+        .speak(`O saldo da conta ${conta.nome} é de ${formatarDinheiro(conta.saldo)}.`)
         .getResponse();
     }
 
@@ -566,6 +684,72 @@ const AdicionarReceitaIntentHandler = criarMovimentacaoIntentHandler(
   "entrada"
 );
 
+const ConsultarGastosIntentHandler = {
+  canHandle(handlerInput) {
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+      Alexa.getIntentName(handlerInput.requestEnvelope) === "ConsultarGastosIntent"
+    );
+  },
+
+  async handle(handlerInput) {
+    const categoriaResolvida = obterSlot(handlerInput, "categoria");
+    const categoriaOriginal = obterSlotOriginal(handlerInput, "categoria");
+    const termos = [categoriaResolvida, categoriaOriginal].filter(Boolean);
+    const resumo = await obterResumoMovimentacoes({
+      tipo: "saida",
+      categoria: termos,
+    });
+
+    if (resumo.quantidade === 0) {
+      const complemento = termos.length ? ` com ${categoriaOriginal || categoriaResolvida}` : "";
+      return handlerInput.responseBuilder
+        .speak(`Não encontrei despesas${complemento} neste mês.`)
+        .getResponse();
+    }
+
+    const complemento = termos.length ? ` com ${categoriaOriginal || categoriaResolvida}` : "";
+    return handlerInput.responseBuilder
+      .speak(
+        `Neste mês você gastou ${formatarDinheiro(resumo.total)}${complemento}, ` +
+          `em ${resumo.quantidade} ${resumo.quantidade === 1 ? "despesa" : "despesas"}.`
+      )
+      .getResponse();
+  },
+};
+
+const ConsultarReceitasIntentHandler = {
+  canHandle(handlerInput) {
+    return (
+      Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+      Alexa.getIntentName(handlerInput.requestEnvelope) === "ConsultarReceitasIntent"
+    );
+  },
+
+  async handle(handlerInput) {
+    const categoriaResolvida = obterSlot(handlerInput, "categoria");
+    const categoriaOriginal = obterSlotOriginal(handlerInput, "categoria");
+    const termos = [categoriaResolvida, categoriaOriginal].filter(Boolean);
+    const resumo = await obterResumoMovimentacoes({
+      tipo: "entrada",
+      categoria: termos,
+    });
+
+    if (resumo.quantidade === 0) {
+      return handlerInput.responseBuilder
+        .speak("Não encontrei receitas neste mês.")
+        .getResponse();
+    }
+
+    return handlerInput.responseBuilder
+      .speak(
+        `Neste mês você recebeu ${formatarDinheiro(resumo.total)}, ` +
+          `em ${resumo.quantidade} ${resumo.quantidade === 1 ? "receita" : "receitas"}.`
+      )
+      .getResponse();
+  },
+};
+
 const ResumoFinanceiroIntentHandler = {
   canHandle(handlerInput) {
     return (
@@ -689,6 +873,8 @@ const skill = Alexa.SkillBuilders.custom()
     ConsultarCartoesIntentHandler,
     AdicionarDespesaIntentHandler,
     AdicionarReceitaIntentHandler,
+    ConsultarGastosIntentHandler,
+    ConsultarReceitasIntentHandler,
     ResumoFinanceiroIntentHandler,
     HelpIntentHandler,
     CancelAndStopIntentHandler,
@@ -722,7 +908,9 @@ app.get("/firebase-status", async (req, res) => {
       uid: userUid,
       documentoUsuarioEncontrado: resumo.usuarioEncontrado,
       movimentacoesHabilitadas: true,
+      consultasMovimentacoesHabilitadas: true,
       intentsGravacao: ["AdicionarDespesaIntent", "AdicionarReceitaIntent"],
+      intentsConsulta: ["ConsultarGastosIntent", "ConsultarReceitasIntent", "ConsultarSaldoIntent"],
       quantidadeContas: resumo.quantidadeContas,
       saldoTotal: resumo.saldoTotal,
       saldoTotalFormatado: formatarDinheiro(resumo.saldoTotal),
