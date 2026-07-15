@@ -213,6 +213,132 @@ async function obterResumoDosCartoes() {
   };
 }
 
+
+
+function normalizarTexto(valor) {
+  return String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function obterSlot(handlerInput, nome) {
+  const slot = handlerInput.requestEnvelope?.request?.intent?.slots?.[nome];
+
+  if (!slot) {
+    return "";
+  }
+
+  const resolvido =
+    slot.resolutions?.resolutionsPerAuthority?.[0]?.values?.[0]?.value?.name;
+
+  return String(resolvido || slot.value || "").trim();
+}
+
+function converterValorFalado(valor) {
+  if (typeof valor === "number") {
+    return valor;
+  }
+
+  const limpo = String(valor || "")
+    .replace(/\./g, "")
+    .replace(",", ".")
+    .replace(/[^0-9.-]/g, "");
+
+  const numero = Number(limpo);
+  return Number.isFinite(numero) ? numero : 0;
+}
+
+function formatarDataMovimentacao(valorData) {
+  const agora = new Date();
+
+  if (!valorData) {
+    return agora.toISOString().replace(/Z$/, "");
+  }
+
+  const texto = String(valorData).trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(texto)) {
+    return `${texto}T12:00:00.000`;
+  }
+
+  const convertida = new Date(texto);
+  if (!Number.isNaN(convertida.getTime())) {
+    return convertida.toISOString().replace(/Z$/, "");
+  }
+
+  return agora.toISOString().replace(/Z$/, "");
+}
+
+async function localizarContaPorNome(nomeInformado) {
+  const termo = normalizarTexto(nomeInformado);
+  const usuarioRef = db.collection("users").doc(userUid);
+  const contasSnapshot = await usuarioRef.collection("contas").get();
+
+  const contas = contasSnapshot.docs.map((documento) => ({
+    id: documento.id,
+    nome: obterNomeConta(documento.data(), documento.id),
+    dados: documento.data(),
+  }));
+
+  if (!termo) {
+    return null;
+  }
+
+  return (
+    contas.find((conta) => normalizarTexto(conta.nome) === termo) ||
+    contas.find((conta) => normalizarTexto(conta.nome).includes(termo)) ||
+    contas.find((conta) => termo.includes(normalizarTexto(conta.nome))) ||
+    null
+  );
+}
+
+async function registrarMovimentacao({
+  tipo,
+  valor,
+  categoria,
+  conta,
+  data,
+  descricao,
+}) {
+  const contaEncontrada = await localizarContaPorNome(conta);
+
+  if (!contaEncontrada) {
+    const erro = new Error(`Conta ${conta || "não informada"} não encontrada.`);
+    erro.codigo = "CONTA_NAO_ENCONTRADA";
+    throw erro;
+  }
+
+  const movimentacoesRef = db
+    .collection("users")
+    .doc(userUid)
+    .collection("movimentacoes");
+
+  const documentoRef = movimentacoesRef.doc();
+  const agora = Date.now();
+
+  const dados = {
+    categoria: categoria || "Outros",
+    cloud_id: documentoRef.id,
+    conta: contaEncontrada.nome,
+    data: formatarDataMovimentacao(data),
+    deleted_at: null,
+    descricao: descricao || (tipo === "entrada" ? "Receita" : "Despesa"),
+    owner_uid: userUid,
+    tipo,
+    updated_at: agora,
+    valor: Number(valor),
+  };
+
+  await documentoRef.set(dados);
+
+  return {
+    id: documentoRef.id,
+    ...dados,
+  };
+}
+
 const LaunchRequestHandler = {
   canHandle(handlerInput) {
     return (
@@ -360,6 +486,86 @@ const ConsultarCartoesIntentHandler = {
   },
 };
 
+
+
+function criarMovimentacaoIntentHandler(nomeIntent, tipo) {
+  return {
+    canHandle(handlerInput) {
+      return (
+        Alexa.getRequestType(handlerInput.requestEnvelope) === "IntentRequest" &&
+        Alexa.getIntentName(handlerInput.requestEnvelope) === nomeIntent
+      );
+    },
+
+    async handle(handlerInput) {
+      const valorFalado = obterSlot(handlerInput, "valor");
+      const categoria = obterSlot(handlerInput, "categoria") || "Outros";
+      const conta = obterSlot(handlerInput, "conta");
+      const data = obterSlot(handlerInput, "data");
+      const descricao = obterSlot(handlerInput, "descricao");
+      const valor = converterValorFalado(valorFalado);
+
+      if (!valor || valor <= 0) {
+        return handlerInput.responseBuilder
+          .speak("Não consegui entender o valor. Diga, por exemplo, cinquenta reais.")
+          .reprompt("Qual é o valor da movimentação?")
+          .getResponse();
+      }
+
+      if (!conta) {
+        return handlerInput.responseBuilder
+          .speak("Em qual conta devo registrar essa movimentação?")
+          .reprompt("Diga o nome da conta, por exemplo, Carteira ou PagBank.")
+          .getResponse();
+      }
+
+      try {
+        const movimentacao = await registrarMovimentacao({
+          tipo,
+          valor,
+          categoria,
+          conta,
+          data,
+          descricao,
+        });
+
+        const palavra = tipo === "entrada" ? "Receita" : "Despesa";
+
+        return handlerInput.responseBuilder
+          .speak(
+            `${palavra} de ${formatarDinheiro(movimentacao.valor)} ` +
+              `registrada na conta ${movimentacao.conta}` +
+              `${movimentacao.descricao ? `, com a descrição ${movimentacao.descricao}` : ""}.`
+          )
+          .getResponse();
+      } catch (error) {
+        console.error(`Erro ao registrar ${tipo}:`, error);
+
+        if (error.codigo === "CONTA_NAO_ENCONTRADA") {
+          return handlerInput.responseBuilder
+            .speak(
+              `Não encontrei a conta ${conta}. ` +
+                "Confira o nome da conta e tente novamente."
+            )
+            .getResponse();
+        }
+
+        throw error;
+      }
+    },
+  };
+}
+
+const AdicionarDespesaIntentHandler = criarMovimentacaoIntentHandler(
+  "AdicionarDespesaIntent",
+  "saida"
+);
+
+const AdicionarReceitaIntentHandler = criarMovimentacaoIntentHandler(
+  "AdicionarReceitaIntent",
+  "entrada"
+);
+
 const ResumoFinanceiroIntentHandler = {
   canHandle(handlerInput) {
     return (
@@ -481,6 +687,8 @@ const skill = Alexa.SkillBuilders.custom()
     ConsultarSaldoIntentHandler,
     ConsultarContasIntentHandler,
     ConsultarCartoesIntentHandler,
+    AdicionarDespesaIntentHandler,
+    AdicionarReceitaIntentHandler,
     ResumoFinanceiroIntentHandler,
     HelpIntentHandler,
     CancelAndStopIntentHandler,
@@ -513,6 +721,8 @@ app.get("/firebase-status", async (req, res) => {
       uidConfigurado: true,
       uid: userUid,
       documentoUsuarioEncontrado: resumo.usuarioEncontrado,
+      movimentacoesHabilitadas: true,
+      intentsGravacao: ["AdicionarDespesaIntent", "AdicionarReceitaIntent"],
       quantidadeContas: resumo.quantidadeContas,
       saldoTotal: resumo.saldoTotal,
       saldoTotalFormatado: formatarDinheiro(resumo.saldoTotal),
