@@ -273,42 +273,125 @@ function obterSlotOriginal(handlerInput, nome) {
   return String(slot?.value || "").trim();
 }
 
-function obterAnoMesAtual() {
+function obterDataSaoPaulo() {
   const partes = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Sao_Paulo",
     year: "numeric",
     month: "2-digit",
+    day: "2-digit",
   }).formatToParts(new Date());
 
   const ano = partes.find((parte) => parte.type === "year")?.value;
   const mes = partes.find((parte) => parte.type === "month")?.value;
-  return `${ano}-${mes}`;
+  const dia = partes.find((parte) => parte.type === "day")?.value;
+
+  return { ano, mes, dia, iso: `${ano}-${mes}-${dia}` };
 }
 
-function movimentacaoEhDoMes(dados, anoMes) {
+function nomeMesPortugues(numeroMes) {
+  const nomes = [
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+  ];
+
+  return nomes[Math.max(0, Math.min(11, Number(numeroMes) - 1))];
+}
+
+function resolverPeriodo(valorData) {
+  const hoje = obterDataSaoPaulo();
+  const original = String(valorData || "").trim();
+  const normalizado = normalizarTexto(original);
+
+  if (!normalizado || normalizado === "este mes" || normalizado === "mes atual") {
+    return {
+      tipo: "mes",
+      prefixo: `${hoje.ano}-${hoje.mes}`,
+      descricao: "neste mês",
+    };
+  }
+
+  if (normalizado === "hoje" || normalizado === "present_ref") {
+    return { tipo: "dia", prefixo: hoje.iso, descricao: "hoje" };
+  }
+
+  if (normalizado === "ontem") {
+    const agora = new Date(`${hoje.iso}T12:00:00-03:00`);
+    agora.setDate(agora.getDate() - 1);
+    const iso = agora.toISOString().slice(0, 10);
+    return { tipo: "dia", prefixo: iso, descricao: "ontem" };
+  }
+
+  const meses = {
+    janeiro: "01", fevereiro: "02", marco: "03", março: "03",
+    abril: "04", maio: "05", junho: "06", julho: "07",
+    agosto: "08", setembro: "09", outubro: "10", novembro: "11", dezembro: "12",
+  };
+
+  const mesFalado = Object.keys(meses).find((nome) => normalizado.includes(normalizarTexto(nome)));
+  if (mesFalado) {
+    const anoFalado = normalizado.match(/\b(20\d{2})\b/)?.[1] || hoje.ano;
+    return {
+      tipo: "mes",
+      prefixo: `${anoFalado}-${meses[mesFalado]}`,
+      descricao: `em ${mesFalado}`,
+    };
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(original)) {
+    return { tipo: "dia", prefixo: original, descricao: `em ${original}` };
+  }
+
+  if (/^\d{4}-\d{2}$/.test(original)) {
+    const [ano, mes] = original.split("-");
+    return {
+      tipo: "mes",
+      prefixo: original,
+      descricao: `em ${nomeMesPortugues(mes)} de ${ano}`,
+    };
+  }
+
+  if (/^\d{4}$/.test(original)) {
+    return { tipo: "ano", prefixo: original, descricao: `em ${original}` };
+  }
+
+  return {
+    tipo: "mes",
+    prefixo: `${hoje.ano}-${hoje.mes}`,
+    descricao: "neste mês",
+  };
+}
+
+function movimentacaoEstaNoPeriodo(dados, periodo) {
   const texto = String(dados.data || "");
-  return texto.slice(0, 7) === anoMes;
+  return texto.startsWith(periodo.prefixo);
 }
 
-async function obterResumoMovimentacoes({ tipo, categoria = "" }) {
+async function obterResumoMovimentacoes({ tipo, categoria = "", data = "" }) {
   const snapshot = await db
     .collection("users")
     .doc(userUid)
     .collection("movimentacoes")
     .get();
 
-  const anoMes = obterAnoMesAtual();
+  const periodo = resolverPeriodo(data);
   const termos = Array.isArray(categoria)
     ? categoria.map(normalizarTexto).filter(Boolean)
     : [normalizarTexto(categoria)].filter(Boolean);
 
   let total = 0;
   let quantidade = 0;
+  let maiorValor = 0;
+  let maiorDescricao = "";
+  const porCategoria = new Map();
 
   snapshot.forEach((documento) => {
     const dados = documento.data();
 
-    if (dados.deleted_at || dados.tipo !== tipo || !movimentacaoEhDoMes(dados, anoMes)) {
+    if (
+      dados.deleted_at ||
+      dados.tipo !== tipo ||
+      !movimentacaoEstaNoPeriodo(dados, periodo)
+    ) {
       return;
     }
 
@@ -329,9 +412,28 @@ async function obterResumoMovimentacoes({ tipo, categoria = "" }) {
 
     total += valor;
     quantidade += 1;
+
+    if (valor > maiorValor) {
+      maiorValor = valor;
+      maiorDescricao = dados.descricao || dados.categoria || "movimentação";
+    }
+
+    const categoriaNome = String(dados.categoria || "Outros").trim() || "Outros";
+    porCategoria.set(categoriaNome, (porCategoria.get(categoriaNome) || 0) + valor);
   });
 
-  return { total, quantidade, anoMes };
+  const maiorCategoria = [...porCategoria.entries()].sort((a, b) => b[1] - a[1])[0] || null;
+
+  return {
+    total,
+    quantidade,
+    periodo,
+    maiorValor,
+    maiorDescricao,
+    maiorCategoria: maiorCategoria
+      ? { nome: maiorCategoria[0], valor: maiorCategoria[1] }
+      : null,
+  };
 }
 
 function converterValorFalado(valor) {
@@ -580,6 +682,35 @@ const ConsultarCartoesIntentHandler = {
         .getResponse();
     }
 
+    const cartaoPedido =
+      obterSlot(handlerInput, "cartao") ||
+      obterSlot(handlerInput, "bandeira") ||
+      obterSlotOriginal(handlerInput, "cartao") ||
+      obterSlotOriginal(handlerInput, "bandeira");
+
+    if (cartaoPedido) {
+      const termo = normalizarTexto(cartaoPedido);
+      const cartao =
+        resumo.cartoes.find((item) => normalizarTexto(item.nome) === termo) ||
+        resumo.cartoes.find((item) => normalizarTexto(item.bandeira) === termo) ||
+        resumo.cartoes.find((item) => normalizarTexto(item.nome).includes(termo)) ||
+        resumo.cartoes.find((item) => normalizarTexto(item.bandeira).includes(termo));
+
+      if (!cartao) {
+        return handlerInput.responseBuilder
+          .speak(`Não encontrei o cartão ${cartaoPedido}.`)
+          .getResponse();
+      }
+
+      return handlerInput.responseBuilder
+        .speak(
+          `${cartao.nome}, da bandeira ${cartao.bandeira}, possui limite cadastrado de ` +
+            `${formatarDinheiro(cartao.limite)}. A fatura fecha no dia ` +
+            `${cartao.diaFechamento} e vence no dia ${cartao.diaVencimento}.`
+        )
+        .getResponse();
+    }
+
     const detalhes = resumo.cartoes
       .map((cartao) => {
         const situacao = cartao.ativo ? "" : " Este cartão está inativo.";
@@ -593,18 +724,16 @@ const ConsultarCartoesIntentHandler = {
       })
       .join(" ");
 
-    const palavraCartao =
-      resumo.quantidadeCartoes === 1 ? "cartão" : "cartões";
+    const palavraCartao = resumo.quantidadeCartoes === 1 ? "cartão" : "cartões";
 
     return handlerInput.responseBuilder
       .speak(
-        `Você possui ${resumo.quantidadeCartoes} ${palavraCartao}. ${detalhes}`
+        `Você possui ${resumo.quantidadeCartoes} ${palavraCartao}, ` +
+          `com limite total cadastrado de ${formatarDinheiro(resumo.limiteTotal)}. ${detalhes}`
       )
       .getResponse();
   },
 };
-
-
 
 function criarMovimentacaoIntentHandler(nomeIntent, tipo) {
   return {
@@ -695,23 +824,30 @@ const ConsultarGastosIntentHandler = {
   async handle(handlerInput) {
     const categoriaResolvida = obterSlot(handlerInput, "categoria");
     const categoriaOriginal = obterSlotOriginal(handlerInput, "categoria");
+    const data = obterSlot(handlerInput, "data") || obterSlotOriginal(handlerInput, "data");
     const termos = [categoriaResolvida, categoriaOriginal].filter(Boolean);
     const resumo = await obterResumoMovimentacoes({
       tipo: "saida",
       categoria: termos,
+      data,
     });
 
+    const complementoCategoria = termos.length
+      ? ` com ${categoriaOriginal || categoriaResolvida}`
+      : "";
+
     if (resumo.quantidade === 0) {
-      const complemento = termos.length ? ` com ${categoriaOriginal || categoriaResolvida}` : "";
       return handlerInput.responseBuilder
-        .speak(`Não encontrei despesas${complemento} neste mês.`)
+        .speak(
+          `Não encontrei despesas${complementoCategoria} ${resumo.periodo.descricao}.`
+        )
         .getResponse();
     }
 
-    const complemento = termos.length ? ` com ${categoriaOriginal || categoriaResolvida}` : "";
     return handlerInput.responseBuilder
       .speak(
-        `Neste mês você gastou ${formatarDinheiro(resumo.total)}${complemento}, ` +
+        `${resumo.periodo.descricao.charAt(0).toUpperCase() + resumo.periodo.descricao.slice(1)}, ` +
+          `você gastou ${formatarDinheiro(resumo.total)}${complementoCategoria}, ` +
           `em ${resumo.quantidade} ${resumo.quantidade === 1 ? "despesa" : "despesas"}.`
       )
       .getResponse();
@@ -729,21 +865,24 @@ const ConsultarReceitasIntentHandler = {
   async handle(handlerInput) {
     const categoriaResolvida = obterSlot(handlerInput, "categoria");
     const categoriaOriginal = obterSlotOriginal(handlerInput, "categoria");
+    const data = obterSlot(handlerInput, "data") || obterSlotOriginal(handlerInput, "data");
     const termos = [categoriaResolvida, categoriaOriginal].filter(Boolean);
     const resumo = await obterResumoMovimentacoes({
       tipo: "entrada",
       categoria: termos,
+      data,
     });
 
     if (resumo.quantidade === 0) {
       return handlerInput.responseBuilder
-        .speak("Não encontrei receitas neste mês.")
+        .speak(`Não encontrei receitas ${resumo.periodo.descricao}.`)
         .getResponse();
     }
 
     return handlerInput.responseBuilder
       .speak(
-        `Neste mês você recebeu ${formatarDinheiro(resumo.total)}, ` +
+        `${resumo.periodo.descricao.charAt(0).toUpperCase() + resumo.periodo.descricao.slice(1)}, ` +
+          `você recebeu ${formatarDinheiro(resumo.total)}, ` +
           `em ${resumo.quantidade} ${resumo.quantidade === 1 ? "receita" : "receitas"}.`
       )
       .getResponse();
@@ -760,29 +899,36 @@ const ResumoFinanceiroIntentHandler = {
   },
 
   async handle(handlerInput) {
-    const resumo = await obterResumoDasContas();
+    const [contas, receitas, despesas, cartoes] = await Promise.all([
+      obterResumoDasContas(),
+      obterResumoMovimentacoes({ tipo: "entrada" }),
+      obterResumoMovimentacoes({ tipo: "saida" }),
+      obterResumoDosCartoes(),
+    ]);
 
-    if (!resumo.usuarioEncontrado) {
+    if (!contas.usuarioEncontrado) {
       return handlerInput.responseBuilder
         .speak("Não encontrei seu cadastro financeiro.")
         .getResponse();
     }
 
-    if (resumo.quantidadeContas === 0) {
-      return handlerInput.responseBuilder
-        .speak("Você ainda não possui contas cadastradas.")
-        .getResponse();
-    }
+    const resultadoMes = receitas.total - despesas.total;
+    const situacao = resultadoMes >= 0
+      ? `Você ficou com resultado positivo de ${formatarDinheiro(resultadoMes)} no mês.`
+      : `Você gastou ${formatarDinheiro(Math.abs(resultadoMes))} a mais do que recebeu no mês.`;
 
-    const maiorConta = resumo.contas[0];
+    const maiorCategoria = despesas.maiorCategoria
+      ? `Sua maior categoria de gastos foi ${despesas.maiorCategoria.nome}, com ${formatarDinheiro(despesas.maiorCategoria.valor)}.`
+      : "";
 
     return handlerInput.responseBuilder
       .speak(
-        `Seu resumo financeiro está disponível. ` +
-          `Você possui ${resumo.quantidadeContas} contas, ` +
-          `com saldo total de ${formatarDinheiro(resumo.saldoTotal)}. ` +
-          `A conta com maior saldo é ${maiorConta.nome}, ` +
-          `com ${formatarDinheiro(maiorConta.saldo)}.`
+        `Seu saldo total em contas é de ${formatarDinheiro(contas.saldoTotal)}. ` +
+          `Neste mês você recebeu ${formatarDinheiro(receitas.total)} e gastou ${formatarDinheiro(despesas.total)}. ` +
+          `${situacao} Você possui ${cartoes.quantidadeCartoesAtivos} ` +
+          `${cartoes.quantidadeCartoesAtivos === 1 ? "cartão ativo" : "cartões ativos"}, ` +
+          `com limite total cadastrado de ${formatarDinheiro(cartoes.limiteTotal)}. ` +
+          `${maiorCategoria}`
       )
       .getResponse();
   },
@@ -800,9 +946,9 @@ const HelpIntentHandler = {
   handle(handlerInput) {
     return handlerInput.responseBuilder
       .speak(
-        "Você pode dizer: qual é meu saldo, quanto tenho em cada conta, " +
-          "quais cartões eu tenho, qual é o limite do meu cartão, " +
-          "ou faça um resumo financeiro."
+        "Você pode perguntar quanto recebeu hoje ou neste mês, quanto tem em uma conta, " +
+          "qual é o vencimento de um cartão, quanto gastou por categoria, " +
+          "ou pedir um resumo financeiro completo."
       )
       .reprompt("O que deseja saber?")
       .getResponse();
@@ -910,7 +1056,8 @@ app.get("/firebase-status", async (req, res) => {
       movimentacoesHabilitadas: true,
       consultasMovimentacoesHabilitadas: true,
       intentsGravacao: ["AdicionarDespesaIntent", "AdicionarReceitaIntent"],
-      intentsConsulta: ["ConsultarGastosIntent", "ConsultarReceitasIntent", "ConsultarSaldoIntent"],
+      consultasAvancadasHabilitadas: true,
+      intentsConsulta: ["ConsultarGastosIntent", "ConsultarReceitasIntent", "ConsultarSaldoIntent", "ConsultarCartoesIntent", "ResumoFinanceiroIntent"],
       quantidadeContas: resumo.quantidadeContas,
       saldoTotal: resumo.saldoTotal,
       saldoTotalFormatado: formatarDinheiro(resumo.saldoTotal),
